@@ -261,6 +261,22 @@ pub fn context_prompt(raw_prompt: Option<&str>, raw_vocabulary: Option<&str>) ->
         .and_then(|raw| serde_json::from_str::<String>(raw).ok())
         .unwrap_or_default();
 
+    fold_context(Some(instructions.as_str()), &terms)
+}
+
+/// Join a prompt and a vocabulary into the one string an API with a single
+/// field takes: the terms first, then the sentence.
+///
+/// Shared by [`context_prompt`] and by the realtime fallback for a model that
+/// takes no `keywords`, so the two cannot drift into describing the same
+/// context differently.
+///
+/// The terms lead because they are the half the older models can use at all —
+/// OpenAI's guide shows a bare comma-separated list of names and says in the
+/// same breath that "Whisper doesn't follow instructions like a general-purpose
+/// text model". The sentence follows for the models that do follow them.
+#[must_use]
+fn fold_context(prompt: Option<&str>, terms: &[String]) -> Option<String> {
     let mut parts: Vec<String> = Vec::with_capacity(2);
     let joined = terms
         .iter()
@@ -271,7 +287,7 @@ pub fn context_prompt(raw_prompt: Option<&str>, raw_vocabulary: Option<&str>) ->
     if !joined.is_empty() {
         parts.push(joined);
     }
-    let instructions = instructions.trim();
+    let instructions = prompt.unwrap_or_default().trim();
     if !instructions.is_empty() {
         parts.push(instructions.to_string());
     }
@@ -365,12 +381,94 @@ pub fn ws_unreachable_detail(endpoint: &str, secure: bool, cause: &str) -> Strin
     format!("Could not reach {endpoint} ({cause}).{hint}")
 }
 
+/// One field of a realtime session config, with the characters OpenAI refuses
+/// taken out.
+///
+/// The realtime API is stricter than the batch one about what a `prompt` or a
+/// `keywords` entry may contain: no `<`, no `>`, no carriage return, no line
+/// feed, and "Keep each keyword on one line". It does not ignore a value that
+/// breaks those rules — it **rejects the session update**, which kills the take
+/// before a word of it is transcribed.
+///
+/// That makes this a correctness requirement rather than tidiness. A context's
+/// prompt is typed into a multi-line box, so newlines in it are the expected
+/// case, not the exotic one; passing one through raw would turn a perfectly
+/// reasonable prompt into a broken recording.
+///
+/// Line breaks become spaces rather than vanishing, so two lines do not run
+/// into one word. The angle brackets are dropped outright: they carry nothing a
+/// model hears, so `<name>` is worth more as `name` than as `  name  `.
+#[must_use]
+pub fn realtime_safe(value: &str) -> String {
+    let stripped: String = value
+        .chars()
+        .map(|c| match c {
+            '\r' | '\n' => ' ',
+            '<' | '>' => '\0',
+            other => other,
+        })
+        .filter(|c| *c != '\0')
+        .collect();
+    // Collapse the runs the substitutions above can leave behind, so a prompt
+    // written as two paragraphs does not arrive with a gap in the middle.
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decode the daemon's two context headers into the two fields a realtime
+/// session takes.
+///
+/// The realtime API has a field for each half — `prompt` for "the recording or
+/// its setting", `keywords` for "product names, acronyms, and other literal
+/// terms" — so unlike the batch path they are not folded together. That is the
+/// whole reason the daemon carries the vocabulary as a list: each consumer
+/// shapes it the way its own API wants, and here that shape is an array.
+///
+/// Both halves are put through [`realtime_safe`]. A keyword that is nothing but
+/// forbidden characters is dropped rather than sent empty.
+#[must_use]
+pub fn realtime_context(
+    raw_prompt: Option<&str>,
+    raw_vocabulary: Option<&str>,
+) -> (Option<String>, Vec<String>) {
+    // A header that will not parse costs the context, not the session — the
+    // same trade the batch path makes, and for the same reason.
+    let prompt = raw_prompt
+        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+        .map(|p| realtime_safe(&p))
+        .filter(|p| !p.is_empty());
+    let keywords = raw_vocabulary
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .map(|term| realtime_safe(term))
+        .filter(|term| !term.is_empty())
+        .collect();
+    (prompt, keywords)
+}
+
 /// The `session.update` that configures a transcription-only realtime session.
 ///
 /// Turn detection is off: the consumer decides when its turn ends (a `stop`
 /// frame or a close), and the session commits the buffer once at that point.
+///
+/// `prompt` and `keywords` are the user's dictation context, already sanitized
+/// by [`realtime_context`]. Only [`LIVE_TRANSCRIBE_MODEL`] is sent `keywords`
+/// as its own field: the guide documents it against that model, and the same
+/// model/field sensitivity that splits `languages` from `language` just below
+/// applies here. Every other realtime model — including the `other-realtime`
+/// placeholder, which points at a third-party server that almost certainly
+/// never heard of `keywords` — gets the terms folded into `prompt` instead,
+/// which is what the batch path does and is strictly better than sending
+/// nothing. Guessing wrong in the other direction is expensive: an unknown
+/// field is not ignored here, it is a rejected session update, and that ends
+/// the take.
 #[must_use]
-pub fn session_update_json(model: &str, language: Option<&str>) -> String {
+pub fn session_update_json(
+    model: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    keywords: &[String],
+) -> String {
     let mut transcription = serde_json::json!({ "model": model });
     if let Some(code) = language {
         if model == LIVE_TRANSCRIBE_MODEL {
@@ -378,6 +476,16 @@ pub fn session_update_json(model: &str, language: Option<&str>) -> String {
         } else {
             transcription["language"] = serde_json::Value::String(code.to_string());
         }
+    }
+    if model == LIVE_TRANSCRIBE_MODEL {
+        if let Some(prompt) = prompt {
+            transcription["prompt"] = serde_json::Value::String(prompt.to_string());
+        }
+        if !keywords.is_empty() {
+            transcription["keywords"] = serde_json::json!(keywords);
+        }
+    } else if let Some(folded) = fold_context(prompt, keywords) {
+        transcription["prompt"] = serde_json::Value::String(folded);
     }
     serde_json::json!({
         "type": "session.update",
@@ -538,8 +646,8 @@ mod tests {
         DEFAULT_BASE_URL, LIVE_TRANSCRIBE_MODEL, REALTIME_SAMPLE_RATE, Resampler,
         audio_append_json, build_multipart, context_prompt, done_json, encode_wav, endpoint_url,
         error_json, is_stop, needs_api_key, parse_base, parse_start, parse_transcript,
-        preview_json, realtime_ws_url, resolve_model, session_update_json, unreachable_detail,
-        upstream_status_detail, ws_unreachable_detail,
+        preview_json, realtime_context, realtime_safe, realtime_ws_url, resolve_model,
+        session_update_json, unreachable_detail, upstream_status_detail, ws_unreachable_detail,
     };
     use base64::Engine as _;
 
@@ -946,7 +1054,7 @@ mod tests {
     #[test]
     fn session_update_json_configures_a_transcription_session() {
         let v: serde_json::Value =
-            serde_json::from_str(&session_update_json("whisper-1", Some("es"))).unwrap();
+            serde_json::from_str(&session_update_json("whisper-1", Some("es"), None, &[])).unwrap();
         assert_eq!(v["type"], "session.update");
         assert_eq!(v["session"]["type"], "transcription");
         let input = &v["session"]["audio"]["input"];
@@ -961,18 +1069,128 @@ mod tests {
     /// upstream error, so only one may ever appear.
     #[test]
     fn session_update_json_uses_the_plural_field_for_live_transcribe() {
-        let v: serde_json::Value =
-            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, Some("en"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            LIVE_TRANSCRIBE_MODEL,
+            Some("en"),
+            None,
+            &[],
+        ))
+        .unwrap();
         let transcription = &v["session"]["audio"]["input"]["transcription"];
         assert_eq!(transcription["languages"][0], "en");
         assert!(transcription["language"].is_null());
 
         // No language at all: neither field appears, and the model detects it.
         let v: serde_json::Value =
-            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None)).unwrap();
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None, None, &[]))
+                .unwrap();
         let transcription = &v["session"]["audio"]["input"]["transcription"];
         assert!(transcription["languages"].is_null());
         assert!(transcription["language"].is_null());
+    }
+
+    /// The realtime API takes the two halves as two fields, so unlike the batch
+    /// path they stay apart — and the vocabulary stays a list, which is the
+    /// whole reason the daemon carries it as one.
+    #[test]
+    fn session_update_json_sends_the_context_as_prompt_and_keywords() {
+        let keywords = vec!["main branch".to_string(), "kubectl".to_string()];
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            LIVE_TRANSCRIBE_MODEL,
+            None,
+            Some("I dictate code."),
+            &keywords,
+        ))
+        .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert_eq!(transcription["prompt"], "I dictate code.");
+        assert_eq!(transcription["keywords"][0], "main branch");
+        assert_eq!(transcription["keywords"][1], "kubectl");
+
+        // No context: neither field appears, rather than appearing empty.
+        let v: serde_json::Value =
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None, None, &[]))
+                .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert!(transcription["prompt"].is_null());
+        assert!(transcription["keywords"].is_null());
+    }
+
+    /// A model that does not document `keywords` never receives the field.
+    ///
+    /// Guessing wrong here is not a no-op: an unknown field is a rejected
+    /// session update, which ends the take before a word is transcribed. So the
+    /// terms are folded into `prompt` instead, exactly as the batch path does.
+    #[test]
+    fn a_model_without_keywords_gets_the_terms_folded_into_the_prompt() {
+        let keywords = vec!["main branch".to_string(), "kubectl".to_string()];
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            "some-third-party-model",
+            None,
+            Some("I dictate code."),
+            &keywords,
+        ))
+        .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert!(
+            transcription["keywords"].is_null(),
+            "a field this model never documented must not be sent"
+        );
+        assert_eq!(
+            transcription["prompt"], "main branch, kubectl. I dictate code.",
+            "the same shape the batch path builds, so the two cannot describe one context differently"
+        );
+    }
+
+    /// The realtime API rejects a session update over these characters, so a
+    /// prompt typed as two paragraphs would otherwise break the take. Newlines
+    /// become spaces rather than vanishing, so two lines do not run together
+    /// into one word.
+    #[test]
+    fn realtime_safe_removes_what_the_api_refuses() {
+        assert_eq!(realtime_safe("line one\nline two"), "line one line two");
+        assert_eq!(realtime_safe("a\r\nb"), "a b");
+        assert_eq!(realtime_safe("<name>"), "name");
+        assert_eq!(realtime_safe("a < b > c"), "a b c");
+        // Runs the substitutions leave behind are collapsed.
+        assert_eq!(realtime_safe("a\n\n\nb"), "a b");
+        assert_eq!(realtime_safe("  padded  "), "padded");
+        // Nothing but forbidden characters is nothing.
+        assert_eq!(realtime_safe("<>\n\r"), "");
+    }
+
+    #[test]
+    fn realtime_context_decodes_and_sanitizes_both_halves() {
+        let (prompt, keywords) = realtime_context(
+            Some(r#""I dictate code.\nPrefer <programming> terms.""#),
+            Some(r#"["main branch","café","<>","multi\nline"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("I dictate code. Prefer programming terms.")
+        );
+        assert_eq!(
+            keywords,
+            vec![
+                "main branch".to_string(),
+                "café".to_string(),
+                "multi line".to_string(),
+            ],
+            "a keyword that was only forbidden characters is dropped, not sent empty"
+        );
+    }
+
+    #[test]
+    fn realtime_context_survives_a_missing_or_malformed_header() {
+        assert_eq!(realtime_context(None, None), (None, Vec::new()));
+        let (prompt, keywords) = realtime_context(Some("not json"), Some(r#"["kubectl"]"#));
+        assert_eq!(prompt, None, "one bad half does not take the other with it");
+        assert_eq!(keywords, vec!["kubectl".to_string()]);
+        // A prompt that is only whitespace is no prompt.
+        assert_eq!(
+            realtime_context(Some(r#""   ""#), Some("[]")),
+            (None, Vec::new())
+        );
     }
 
     #[test]

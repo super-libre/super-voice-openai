@@ -72,11 +72,29 @@ and the prompt "I dictate code." is sent as:
 main branch, rebase, kubectl. I dictate code.
 ```
 
-Two limits are worth knowing. `whisper-1` documents a **224-token** ceiling on
-the prompt, and OpenAI does not say what happens past it — so keep a vocabulary
-you care about short rather than relying on a truncation rule that is not
-written down. And the realtime models do not take a context at all yet; it
-applies to the batch transcription path only.
+`whisper-1` documents a **224-token** ceiling on the prompt, and OpenAI does not
+say what happens past it — so keep a vocabulary you care about short rather than
+relying on a truncation rule that is not written down.
+
+### On the realtime models
+
+The realtime API has a field for each half, so nothing is folded together there:
+the prompt goes to `prompt` ("describe the recording or its setting") and the
+terms go to `keywords` ("product names, acronyms, and other literal terms"), as
+a real list. Keywords are hints, not required output.
+
+`keywords` is sent only to `gpt-live-transcribe`, which is the model OpenAI
+documents it against. `other-realtime` points at a third-party server that has
+most likely never heard of the field, and an unrecognized field there is not
+ignored — it is a **rejected session update**, which ends the recording before a
+word of it is transcribed. So that model gets the terms folded into `prompt`
+instead, the same way the batch path does.
+
+For the same reason, both fields are sanitized before they are sent. The
+realtime API refuses `<`, `>`, carriage returns and line feeds, and a context
+prompt is typed into a multi-line box — so line breaks become spaces and the
+angle brackets are dropped. Without that, a perfectly ordinary two-line prompt
+would break the take.
 
 ## Realtime
 

@@ -13,6 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use common::{ConsumerStreamTransport, WasmBackend, WsFrame};
 use futures::{SinkExt, StreamExt};
+use super_stt_backend_openai::LIVE_TRANSCRIBE_MODEL;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::accept_async;
@@ -21,6 +22,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 const SECRET: &str = "x-stt-secret-openai_api_key";
 const BASE_URL: &str = "x-stt-option-base_url";
 const CUSTOM_MODEL: &str = "x-stt-option-custom_model";
+const PROMPT: &str = "x-stt-prompt";
+const VOCABULARY: &str = "x-stt-vocabulary";
 
 /// 3200 bytes = 1600 samples = 100 ms at 16 kHz — the shape a consumer streams.
 const CHUNK_100MS: usize = 3200;
@@ -284,6 +287,81 @@ async fn realtime_custom_model_is_sent_upstream() {
     assert_eq!(transcription["model"], "Systran/faster-whisper");
     assert_eq!(transcription["language"], "es");
     assert!(transcription["languages"].is_null());
+}
+
+/// The dictation context reaches the realtime session as `prompt` and
+/// `keywords`, decoded and sanitized.
+///
+/// End-to-end rather than only a unit test, because what is being exercised is
+/// a pair of header names crossing a crate boundary — and here the shape on the
+/// far side is a JSON array, which no unit test of this crate alone can prove
+/// the daemon and the component agree on. The two load-bearing inputs are the
+/// accented term, which arrives `\uXXXX`-escaped and must come back out as
+/// itself, and the newline in the prompt: the realtime API rejects a session
+/// update containing one, so a prompt typed as two lines has to arrive as one.
+#[tokio::test]
+async fn realtime_sends_the_dictation_context_as_prompt_and_keywords() {
+    let path = component_or_skip!();
+    let (authority, mock) = start_mock_upstream().await;
+
+    let backend = WasmBackend::new(
+        &path,
+        vec![authority.clone()],
+        LIVE_TRANSCRIBE_MODEL.to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+            // Exactly as the daemon injects them: JSON, escaped to pure ASCII.
+            (
+                PROMPT.to_string(),
+                r#""I dictate code.\nPrefer programming terms.""#.to_string(),
+            ),
+            (
+                VOCABULARY.to_string(),
+                r#"["main branch","café"]"#.to_string(),
+            ),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let (consumer_tx, consumer_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let (guest_tx, mut guest_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let transport = ConsumerStreamTransport {
+        incoming: consumer_rx,
+        outgoing: guest_tx,
+    };
+    let driver = drive_consumer(
+        consumer_tx,
+        r#"{"type":"start","sample_rate":16000}"#,
+        2,
+        CHUNK_100MS,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(30), backend.realtime_session(transport))
+        .await
+        .expect("session timed out");
+    let _held = driver.await.unwrap();
+    result.expect("session returned an error");
+    let _ = consumer_texts(&mut guest_rx);
+
+    let seen = mock.await.expect("mock upstream panicked");
+    let config: serde_json::Value = serde_json::from_str(
+        &seen
+            .session_update
+            .expect("the guest must configure the session"),
+    )
+    .expect("session.update must be JSON");
+    let transcription = &config["session"]["audio"]["input"]["transcription"];
+    assert_eq!(
+        transcription["prompt"], "I dictate code. Prefer programming terms.",
+        "the newline must not survive \u{2014} the API rejects a session update carrying one"
+    );
+    assert_eq!(transcription["keywords"][0], "main branch");
+    assert_eq!(
+        transcription["keywords"][1], "café",
+        "the escaped term has to decode back to what the user typed"
+    );
 }
 
 /// Less than the 100 ms OpenAI will commit is answered with an empty transcript

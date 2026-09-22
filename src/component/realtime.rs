@@ -122,7 +122,21 @@ fn run(headers: &[(String, Vec<u8>)], consumer: &ConsumerStream) -> Result<(), W
     if !await_session_created(&upstream, consumer, &url) {
         return Ok(());
     }
-    if let Err(e) = upstream.send_text(&crate::session_update_json(&model, language.as_deref())) {
+    // The user's dictation context, read from the same injected headers the
+    // batch path uses. Read here rather than at the top because it is only
+    // needed for this one message: a context changed mid-session does not reach
+    // a session already running, which is the same rule as every other setting
+    // on this path.
+    let (prompt, keywords) = crate::realtime_context(
+        crate::header(headers, "x-stt-prompt").as_deref(),
+        crate::header(headers, "x-stt-vocabulary").as_deref(),
+    );
+    if let Err(e) = upstream.send_text(&crate::session_update_json(
+        &model,
+        language.as_deref(),
+        prompt.as_deref(),
+        &keywords,
+    )) {
         let _ = consumer.send_text(&crate::error_json(&format!(
             "{url} rejected the session configuration ({})",
             describe(&e)
