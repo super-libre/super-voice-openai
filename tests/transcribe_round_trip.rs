@@ -18,6 +18,8 @@ use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 const SECRET: &str = "x-stt-secret-openai_api_key";
 const BASE_URL: &str = "x-stt-option-base_url";
 const CUSTOM_MODEL: &str = "x-stt-option-custom_model";
+const PROMPT: &str = "x-stt-prompt";
+const VOCABULARY: &str = "x-stt-vocabulary";
 
 /// A `wiremock` matcher asserting the request body contains `needle`. Decodes
 /// lossily because the multipart body carries binary WAV bytes (invalid UTF-8);
@@ -26,6 +28,14 @@ struct BodyContains(&'static str);
 impl Match for BodyContains {
     fn matches(&self, req: &Request) -> bool {
         String::from_utf8_lossy(&req.body).contains(self.0)
+    }
+}
+
+/// The inverse of [`BodyContains`], for a field that must not be sent at all.
+struct NoBodyContains(&'static str);
+impl Match for NoBodyContains {
+    fn matches(&self, req: &Request) -> bool {
+        !String::from_utf8_lossy(&req.body).contains(self.0)
     }
 }
 
@@ -257,6 +267,104 @@ async fn language_forwarded_in_multipart() {
         .await
         .expect("transcription should succeed");
     assert_eq!(text, "hola mundo");
+}
+
+/// The dictation context reaches OpenAI as the one `prompt` field it takes,
+/// with the vocabulary first and the escaped non-ASCII decoded back out.
+///
+/// Worth an end-to-end test rather than only a unit one, because the interface
+/// being exercised is a pair of headers: two crates that share no type agree on
+/// their names and their encoding, and nothing but this would notice them
+/// drifting. The accented term is the load-bearing part — the daemon escapes
+/// both headers to `\uXXXX` precisely because a raw one builds a header value
+/// it cannot read back, so a `café` that arrives as `café` and reaches the
+/// upstream as `café` is the whole round trip in one assertion.
+#[tokio::test]
+async fn the_dictation_context_is_forwarded_as_the_prompt_field() {
+    let Some(component) = component_path() else {
+        eprintln!("skipping: component not built (run `just build-component`)");
+        return;
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(BodyContains(
+            "name=\"prompt\"\r\n\r\nmain branch, café. I dictate code.\r\n",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "text": "push it to the main branch" })),
+        )
+        .mount(&server)
+        .await;
+
+    let authority = server.address().to_string();
+    let mut backend = WasmBackend::new(
+        &component,
+        vec![authority.clone()],
+        "whisper-1".to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+            // Exactly as the daemon injects them: JSON, escaped to pure ASCII.
+            (PROMPT.to_string(), r#""I dictate code.""#.to_string()),
+            (
+                VOCABULARY.to_string(),
+                r#"["main branch","café"]"#.to_string(),
+            ),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let audio = vec![0.0_f32; 1600];
+    let text = backend
+        .transcribe_audio(&audio, 16000)
+        .await
+        .expect("transcription should succeed");
+    assert_eq!(text, "push it to the main branch");
+}
+
+/// A backend given no context sends no `prompt` field, rather than an empty
+/// one — which is a different request, and one OpenAI is entitled to read
+/// differently.
+#[tokio::test]
+async fn no_context_means_no_prompt_field() {
+    let Some(component) = component_path() else {
+        eprintln!("skipping: component not built (run `just build-component`)");
+        return;
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(NoBodyContains("name=\"prompt\""))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hello world" })),
+        )
+        .mount(&server)
+        .await;
+
+    let authority = server.address().to_string();
+    let mut backend = WasmBackend::new(
+        &component,
+        vec![authority.clone()],
+        "whisper-1".to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let audio = vec![0.0_f32; 1600];
+    let text = backend
+        .transcribe_audio(&audio, 16000)
+        .await
+        .expect("transcription should succeed");
+    assert_eq!(text, "hello world");
 }
 
 /// Selecting the manifest's `other` model sends the `custom_model` option as the

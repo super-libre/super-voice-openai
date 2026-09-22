@@ -225,10 +225,69 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a `multipart/form-data` body with `model`, an optional `language`, and
-/// `file` (audio.wav).
+/// Turn the daemon's dictation-context headers into the single `prompt` string
+/// OpenAI's transcription API takes.
+///
+/// `raw_prompt` is `x-stt-prompt` (a JSON string) and `raw_vocabulary` is
+/// `x-stt-vocabulary` (a JSON array of strings), exactly as
+/// `docs/protocol/backend/contract.md` describes them. Both are escaped to
+/// pure ASCII by the daemon, so `serde_json` is the whole decode.
+///
+/// The two halves are joined because OpenAI has one field for them, and the
+/// **vocabulary goes first**. It is the half `whisper-1` can actually use —
+/// OpenAI's own guide describes the parameter as a way "to pass a dictionary of
+/// the correct spellings" and its example is a bare comma-separated list of
+/// names, while the same guide says "Whisper doesn't follow instructions like a
+/// general-purpose text model". Leading with the list gives the older model the
+/// shape it was shown; `gpt-4o-transcribe`, which does follow instructions,
+/// reads the sentence that follows.
+///
+/// Nothing is truncated here. `whisper-1` documents a 224-token ceiling but not
+/// what happens past it, so guessing which end to cut would be inventing a rule
+/// the API has not stated — and the daemon has already refused anything long
+/// enough to break the request itself.
+///
+/// Returns `None` when neither header carries anything, so the caller omits the
+/// field rather than sending an empty one.
 #[must_use]
-pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav: &[u8]) -> Vec<u8> {
+pub fn context_prompt(raw_prompt: Option<&str>, raw_vocabulary: Option<&str>) -> Option<String> {
+    // A header that will not parse is dropped rather than failing the request:
+    // a malformed context is the daemon's bug, and losing a transcription over
+    // it would take the user's audio down with it.
+    let terms: Vec<String> = raw_vocabulary
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let instructions = raw_prompt
+        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+        .unwrap_or_default();
+
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    let joined = terms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !joined.is_empty() {
+        parts.push(joined);
+    }
+    let instructions = instructions.trim();
+    if !instructions.is_empty() {
+        parts.push(instructions.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+/// Build a `multipart/form-data` body with `model`, an optional `language`, an
+/// optional `prompt`, and `file` (audio.wav).
+#[must_use]
+pub fn build_multipart(
+    boundary: &str,
+    model: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    wav: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
@@ -238,6 +297,12 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
         body.extend_from_slice(lang.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    if let Some(prompt) = prompt.filter(|p| !p.is_empty()) {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(prompt.as_bytes());
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -471,9 +536,9 @@ impl Resampler {
 mod tests {
     use super::{
         DEFAULT_BASE_URL, LIVE_TRANSCRIBE_MODEL, REALTIME_SAMPLE_RATE, Resampler,
-        audio_append_json, build_multipart, done_json, encode_wav, endpoint_url, error_json,
-        is_stop, needs_api_key, parse_base, parse_start, parse_transcript, preview_json,
-        realtime_ws_url, resolve_model, session_update_json, unreachable_detail,
+        audio_append_json, build_multipart, context_prompt, done_json, encode_wav, endpoint_url,
+        error_json, is_stop, needs_api_key, parse_base, parse_start, parse_transcript,
+        preview_json, realtime_ws_url, resolve_model, session_update_json, unreachable_detail,
         upstream_status_detail, ws_unreachable_detail,
     };
     use base64::Engine as _;
@@ -695,7 +760,7 @@ mod tests {
 
     #[test]
     fn build_multipart_frames_model_and_file() {
-        let body = build_multipart("BOUNDARY", "whisper-1", None, b"WAVDATA");
+        let body = build_multipart("BOUNDARY", "whisper-1", None, None, b"WAVDATA");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("--BOUNDARY\r\n"));
         assert!(text.contains("name=\"model\""));
@@ -711,10 +776,101 @@ mod tests {
 
     #[test]
     fn build_multipart_includes_language_when_present() {
-        let body = build_multipart("BOUNDARY", "whisper-1", Some("es"), b"WAVDATA");
+        let body = build_multipart("BOUNDARY", "whisper-1", Some("es"), None, b"WAVDATA");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("name=\"language\""));
         assert!(text.contains("\r\n\r\nes\r\n"));
+    }
+
+    #[test]
+    fn build_multipart_includes_the_prompt_when_present() {
+        let body = build_multipart(
+            "BOUNDARY",
+            "whisper-1",
+            None,
+            Some("main branch, kubectl"),
+            b"WAVDATA",
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"prompt\""));
+        assert!(text.contains("\r\n\r\nmain branch, kubectl\r\n"));
+
+        // An empty prompt is no prompt: the field is omitted rather than sent
+        // blank, which is a different request.
+        let empty = build_multipart("BOUNDARY", "whisper-1", None, Some(""), b"WAVDATA");
+        assert!(!String::from_utf8_lossy(&empty).contains("name=\"prompt\""));
+    }
+
+    /// The vocabulary leads, because it is the half `whisper-1` can use at all
+    /// — OpenAI's guide shows a bare comma-separated list and says the model
+    /// does not follow instructions. The sentence follows it for the models
+    /// that do.
+    #[test]
+    fn the_context_becomes_one_prompt_with_the_words_first() {
+        let prompt = context_prompt(
+            Some(r#""I dictate code.""#),
+            Some(r#"["main branch","kubectl"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("main branch, kubectl. I dictate code.")
+        );
+    }
+
+    /// Either half on its own is a perfectly good context, and neither is.
+    #[test]
+    fn each_half_stands_alone_and_neither_is_nothing() {
+        assert_eq!(
+            context_prompt(None, Some(r#"["kubectl"]"#)).as_deref(),
+            Some("kubectl")
+        );
+        assert_eq!(
+            context_prompt(Some(r#""Be terse.""#), None).as_deref(),
+            Some("Be terse.")
+        );
+        assert_eq!(context_prompt(None, None), None);
+        assert_eq!(
+            context_prompt(Some(r#"""#.repeat(2).as_str()), Some("[]")),
+            None,
+            "empty on both sides sends no field at all"
+        );
+        assert_eq!(
+            context_prompt(Some(r#""   ""#), Some(r#"["  ",""]"#)),
+            None,
+            "whitespace is not a context"
+        );
+    }
+
+    /// The daemon escapes both headers to pure ASCII, so a Spanish prompt
+    /// arrives as `\uXXXX` and has to come back out as itself. This is the
+    /// backend half of the round trip the daemon's encoder exists for.
+    #[test]
+    fn a_non_ascii_context_decodes_back_to_what_the_user_typed() {
+        let prompt = context_prompt(
+            Some(r#""Dicto código.""#),
+            Some(r#"["Menjivar, Jorge","café"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("Menjivar, Jorge, café. Dicto código."),
+            "a term holding a comma survives as one term, which a flat header could not promise"
+        );
+    }
+
+    /// A header the backend cannot parse costs the context, not the
+    /// transcription. Losing the user's audio over the daemon's bug would be
+    /// the worse of the two failures by a wide margin.
+    #[test]
+    fn a_malformed_header_is_dropped_rather_than_failing_the_request() {
+        assert_eq!(
+            context_prompt(Some("not json"), Some("also not json")),
+            None
+        );
+        assert_eq!(
+            context_prompt(Some("not json"), Some(r#"["kubectl"]"#)).as_deref(),
+            Some("kubectl"),
+            "one bad half does not take the other with it"
+        );
     }
 
     // ── realtime helpers ────────────────────────────────────────────────────

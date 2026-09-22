@@ -49,6 +49,35 @@ self-hosted or gateway endpoint set through **API base URL** is called with no
 `Authorization` header at all when no key is set. Set a key and it is sent as
 `Bearer` to whatever endpoint is configured.
 
+## Dictation contexts
+
+This backend accepts a [dictation
+context](https://github.com/jorge-menjivar/super-stt/blob/main/docs/protocol/endpoints/v1/context.md)
+— the words you are dictating, so the model hears them instead of guessing at
+them. Pick one in the app; there is nothing to configure here.
+
+Super STT sends the context's two halves as `x-stt-prompt` and
+`x-stt-vocabulary`, and this backend folds them into the single `prompt` field
+OpenAI's transcription API takes. The **vocabulary goes first**, because it is
+the half `whisper-1` can use at all: OpenAI's guide describes the parameter as a
+way "to pass a dictionary of the correct spellings" and says in the same breath
+that "Whisper doesn't follow instructions like a general-purpose text model".
+The prompt sentence follows it, for `gpt-4o-transcribe` and
+`gpt-4o-mini-transcribe`, which do follow instructions.
+
+So a context named "Coding" with the terms `main branch`, `rebase`, `kubectl`
+and the prompt "I dictate code." is sent as:
+
+```
+main branch, rebase, kubectl. I dictate code.
+```
+
+Two limits are worth knowing. `whisper-1` documents a **224-token** ceiling on
+the prompt, and OpenAI does not say what happens past it — so keep a vocabulary
+you care about short rather than relying on a truncation rule that is not
+written down. And the realtime models do not take a context at all yet; it
+applies to the batch transcription path only.
+
 ## Realtime
 
 The `realtime` models stream instead of uploading a finished recording. Super STT hands

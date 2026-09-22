@@ -27,6 +27,12 @@
   # hands each consumer session to. Required by the `realtime = true` models.
   websocket = true
 
+  # Opts into being handed the user's dictation context as `x-stt-prompt` and
+  # `x-stt-vocabulary`. Both are folded into the one `prompt` field OpenAI's
+  # transcription API takes, so a vocabulary the user typed reaches the model
+  # that keeps mishearing those words.
+  context = true
+
 [[secrets]]
   name        = "openai_api_key"
   label       = "OpenAI API key"

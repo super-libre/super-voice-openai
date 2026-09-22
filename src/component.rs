@@ -20,8 +20,8 @@ wit_bindgen::generate!({
 });
 
 use crate::{
-    DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
-    parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
+    DEFAULT_BASE_URL, build_multipart, context_prompt, encode_wav, endpoint_url, needs_api_key,
+    parse_base, parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
 };
 
 use exports::wasi::http::incoming_handler::Guest;
@@ -142,11 +142,20 @@ fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
         Some(code) => Some(code),
     };
 
+    // The user's dictation context, as one `prompt` string. Read from the
+    // headers rather than the body: it is the daemon's, not the caller's, and
+    // it rides every `/v1` request the same way the secret and the options do.
+    let prompt = context_prompt(
+        crate::header(&entries, "x-stt-prompt").as_deref(),
+        crate::header(&entries, "x-stt-vocabulary").as_deref(),
+    );
+
     match call_openai(
         &base_url,
         api_key.as_deref(),
         &model,
         language,
+        prompt.as_deref(),
         &audio,
         sample_rate,
     ) {
@@ -169,12 +178,13 @@ fn call_openai(
     api_key: Option<&str>,
     model: &str,
     language: Option<&str>,
+    prompt: Option<&str>,
     audio: &[f32],
     sample_rate: u32,
 ) -> Result<String, String> {
     let wav = encode_wav(audio, sample_rate);
     let boundary = "----superstt7MA4YWxkTrZu0gW";
-    let multipart = build_multipart(boundary, model, language, &wav);
+    let multipart = build_multipart(boundary, model, language, prompt, &wav);
     let (https, authority, prefix) = parse_base(base_url);
     let scheme = if https { Scheme::Https } else { Scheme::Http };
     let path = format!("{prefix}/audio/transcriptions");
