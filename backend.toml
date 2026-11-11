@@ -12,7 +12,7 @@
   # user's settings and selected model are named by it.
   source      = "github.com/jorge-menjivar/super-stt-openai"
   name        = "OpenAI"
-  version     = "0.1.2"
+  version     = "0.2.0"
   kind        = "wasm"
   entrypoint  = "openai.wasm"
   contract    = "v2"
