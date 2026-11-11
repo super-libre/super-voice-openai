@@ -318,7 +318,7 @@ async fn realtime_sends_the_dictation_context_as_prompt_and_keywords() {
             ),
             (
                 VOCABULARY.to_string(),
-                r#"["main branch","café"]"#.to_string(),
+                r#"["main branch","caf\u00e9"]"#.to_string(),
             ),
         ],
     )

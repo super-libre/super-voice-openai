@@ -277,8 +277,8 @@ async fn language_forwarded_in_multipart() {
 /// their names and their encoding, and nothing but this would notice them
 /// drifting. The accented term is the load-bearing part — the daemon escapes
 /// both headers to `\uXXXX` precisely because a raw one builds a header value
-/// it cannot read back, so a `café` that arrives as `café` and reaches the
-/// upstream as `café` is the whole round trip in one assertion.
+/// it cannot read back, so a `caf\u00e9` that reaches the upstream as
+/// `café` is the whole round trip in one assertion.
 #[tokio::test]
 async fn the_dictation_context_is_forwarded_as_the_prompt_field() {
     let Some(component) = component_path() else {
@@ -311,7 +311,7 @@ async fn the_dictation_context_is_forwarded_as_the_prompt_field() {
             (PROMPT.to_string(), r#""I dictate code.""#.to_string()),
             (
                 VOCABULARY.to_string(),
-                r#"["main branch","café"]"#.to_string(),
+                r#"["main branch","caf\u00e9"]"#.to_string(),
             ),
         ],
     )

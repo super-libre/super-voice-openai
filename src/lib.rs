@@ -955,8 +955,8 @@ mod tests {
     #[test]
     fn a_non_ascii_context_decodes_back_to_what_the_user_typed() {
         let prompt = context_prompt(
-            Some(r#""Dicto código.""#),
-            Some(r#"["Menjivar, Jorge","café"]"#),
+            Some(r#""Dicto c\u00f3digo.""#),
+            Some(r#"["Menjivar, Jorge","caf\u00e9"]"#),
         );
         assert_eq!(
             prompt.as_deref(),
@@ -1163,7 +1163,7 @@ mod tests {
     fn realtime_context_decodes_and_sanitizes_both_halves() {
         let (prompt, keywords) = realtime_context(
             Some(r#""I dictate code.\nPrefer <programming> terms.""#),
-            Some(r#"["main branch","café","<>","multi\nline"]"#),
+            Some(r#"["main branch","caf\u00e9","<>","multi\nline"]"#),
         );
         assert_eq!(
             prompt.as_deref(),
