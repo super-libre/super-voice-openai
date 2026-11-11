@@ -13,14 +13,17 @@ use std::time::Duration;
 use base64::Engine as _;
 use common::{ConsumerStreamTransport, WasmBackend, WsFrame};
 use futures::{SinkExt, StreamExt};
+use super_voice_backend_openai::LIVE_TRANSCRIBE_MODEL;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-const SECRET: &str = "x-stt-secret-openai_api_key";
-const BASE_URL: &str = "x-stt-option-base_url";
-const CUSTOM_MODEL: &str = "x-stt-option-custom_model";
+const SECRET: &str = "x-voice-secret-openai_api_key";
+const BASE_URL: &str = "x-voice-option-base_url";
+const CUSTOM_MODEL: &str = "x-voice-option-custom_model";
+const PROMPT: &str = "x-voice-prompt";
+const VOCABULARY: &str = "x-voice-vocabulary";
 
 /// 3200 bytes = 1600 samples = 100 ms at 16 kHz — the shape a consumer streams.
 const CHUNK_100MS: usize = 3200;
@@ -40,8 +43,10 @@ macro_rules! component_or_skip {
 /// What the mock upstream saw the guest send.
 #[derive(Default)]
 struct Upstream {
-    /// The `session.update` frame, verbatim.
+    /// The first `session.update` frame, verbatim.
     session_update: Option<String>,
+    /// Every `session.update` frame, in order.
+    session_updates: Vec<String>,
     /// Total PCM bytes across every `input_audio_buffer.append`, base64-decoded.
     audio_bytes: usize,
     /// Whether the turn was committed.
@@ -49,10 +54,20 @@ struct Upstream {
 }
 
 /// Mock OpenAI realtime upstream. Accepts the WS upgrade, sends
-/// `session.created`, records the session config and appended audio, and on
+/// `session.created`, answers each `session.update` with `session.updated` as
+/// OpenAI does, records the session config and appended audio, and on
 /// `input_audio_buffer.commit` replies with two transcription deltas then the
 /// completed event. Returns the bound authority and a handle to what it saw.
 async fn start_mock_upstream() -> (String, tokio::task::JoinHandle<Upstream>) {
+    start_mock_upstream_with(false).await
+}
+
+/// [`start_mock_upstream`], refusing with an `error` a `session.update` that
+/// carries a `prompt` or `keywords` when `refuse_context` is set: what OpenAI
+/// does with a prompt past the model's length limit.
+async fn start_mock_upstream_with(
+    refuse_context: bool,
+) -> (String, tokio::task::JoinHandle<Upstream>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let authority = listener.local_addr().unwrap().to_string(); // "127.0.0.1:PORT"
     let handle = tokio::spawn(async move {
@@ -73,7 +88,19 @@ async fn start_mock_upstream() -> (String, tokio::task::JoinHandle<Upstream>) {
             let event: serde_json::Value =
                 serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
             match event["type"].as_str() {
-                Some("session.update") => seen.session_update = Some(text.to_string()),
+                Some("session.update") => {
+                    let transcription = &event["session"]["audio"]["input"]["transcription"];
+                    let has_context =
+                        !transcription["prompt"].is_null() || !transcription["keywords"].is_null();
+                    seen.session_update.get_or_insert_with(|| text.to_string());
+                    seen.session_updates.push(text.to_string());
+                    let answer = if refuse_context && has_context {
+                        r#"{"type":"error","error":{"type":"invalid_request_error","message":"The prompt is too long.","param":"session.audio.input.transcription.prompt"}}"#
+                    } else {
+                        r#"{"type":"session.updated"}"#
+                    };
+                    let _ = ws.send(WsMessage::Text(answer.into())).await;
+                }
                 Some("input_audio_buffer.append") => {
                     let audio = event["audio"].as_str().unwrap_or_default();
                     let pcm = base64::engine::general_purpose::STANDARD
@@ -143,7 +170,7 @@ async fn realtime_round_trip() {
     let path = component_or_skip!();
     let (authority, mock) = start_mock_upstream().await;
 
-    // The guest builds the upstream URL from x-stt-option-base_url. Point it at
+    // The guest builds the upstream URL from x-voice-option-base_url. Point it at
     // the mock over plaintext ws:// (http:// -> ws:// in the guest). The mock is
     // on loopback, which the SSRF guard blocks for untrusted backends, so the
     // test opts in via `permit_loopback_egress` below.
@@ -284,6 +311,151 @@ async fn realtime_custom_model_is_sent_upstream() {
     assert_eq!(transcription["model"], "Systran/faster-whisper");
     assert_eq!(transcription["language"], "es");
     assert!(transcription["languages"].is_null());
+}
+
+/// The dictation context reaches the realtime session as `prompt` and
+/// `keywords`, decoded and sanitized.
+///
+/// End-to-end rather than only a unit test, because what is being exercised is
+/// a pair of header names crossing a crate boundary — and here the shape on the
+/// far side is a JSON array, which no unit test of this crate alone can prove
+/// the daemon and the component agree on. The two load-bearing inputs are the
+/// accented term, which arrives `\uXXXX`-escaped and must come back out as
+/// itself, and the newline in the prompt: the realtime API rejects a session
+/// update containing one, so a prompt typed as two lines has to arrive as one.
+#[tokio::test]
+async fn realtime_sends_the_dictation_context_as_prompt_and_keywords() {
+    let path = component_or_skip!();
+    let (authority, mock) = start_mock_upstream().await;
+
+    let backend = WasmBackend::new(
+        &path,
+        vec![authority.clone()],
+        LIVE_TRANSCRIBE_MODEL.to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+            // Exactly as the daemon injects them: JSON, escaped to pure ASCII.
+            (
+                PROMPT.to_string(),
+                r#""I dictate code.\nPrefer programming terms.""#.to_string(),
+            ),
+            (
+                VOCABULARY.to_string(),
+                r#"["main branch","caf\u00e9"]"#.to_string(),
+            ),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let (consumer_tx, consumer_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let (guest_tx, mut guest_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let transport = ConsumerStreamTransport {
+        incoming: consumer_rx,
+        outgoing: guest_tx,
+    };
+    let driver = drive_consumer(
+        consumer_tx,
+        r#"{"type":"start","sample_rate":16000}"#,
+        2,
+        CHUNK_100MS,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(30), backend.realtime_session(transport))
+        .await
+        .expect("session timed out");
+    let _held = driver.await.unwrap();
+    result.expect("session returned an error");
+    let _ = consumer_texts(&mut guest_rx);
+
+    let seen = mock.await.expect("mock upstream panicked");
+    let config: serde_json::Value = serde_json::from_str(
+        &seen
+            .session_update
+            .expect("the guest must configure the session"),
+    )
+    .expect("session.update must be JSON");
+    let transcription = &config["session"]["audio"]["input"]["transcription"];
+    assert_eq!(
+        transcription["prompt"], "I dictate code. Prefer programming terms.",
+        "the newline must not survive \u{2014} the API rejects a session update carrying one"
+    );
+    assert_eq!(transcription["keywords"][0], "main branch");
+    assert_eq!(
+        transcription["keywords"][1], "café",
+        "the escaped term has to decode back to what the user typed"
+    );
+}
+
+/// A context OpenAI refuses, a prompt past the model's unpublished length
+/// limit, costs the context and not the recording: the session configures
+/// itself again without it and transcribes.
+#[tokio::test]
+async fn realtime_a_refused_context_costs_the_context_not_the_recording() {
+    let path = component_or_skip!();
+    let (authority, mock) = start_mock_upstream_with(true).await;
+
+    let backend = WasmBackend::new(
+        &path,
+        vec![authority.clone()],
+        LIVE_TRANSCRIBE_MODEL.to_string(),
+        vec![
+            (SECRET.to_string(), "test-key".to_string()),
+            (BASE_URL.to_string(), format!("http://{authority}")),
+            (PROMPT.to_string(), r#""I dictate code.""#.to_string()),
+            (VOCABULARY.to_string(), r#"["main branch"]"#.to_string()),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let (consumer_tx, consumer_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let (guest_tx, mut guest_rx) = tokio::sync::mpsc::unbounded_channel::<WsFrame>();
+    let transport = ConsumerStreamTransport {
+        incoming: consumer_rx,
+        outgoing: guest_tx,
+    };
+    let driver = drive_consumer(
+        consumer_tx,
+        r#"{"type":"start","sample_rate":16000}"#,
+        2,
+        CHUNK_100MS,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(30), backend.realtime_session(transport))
+        .await
+        .expect("session timed out");
+    let _held = driver.await.unwrap();
+    result.expect("session returned an error");
+    let texts = consumer_texts(&mut guest_rx);
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains(r#""type":"done""#) && t.contains("hello world")),
+        "the recording must still be transcribed: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains(r#""type":"error""#)),
+        "the refused context must not reach the consumer as an error: {texts:?}"
+    );
+
+    let seen = mock.await.expect("mock upstream panicked");
+    assert!(seen.committed, "the audio must still be committed");
+    let updates: Vec<serde_json::Value> = seen
+        .session_updates
+        .iter()
+        .map(|u| serde_json::from_str(u).expect("session.update must be JSON"))
+        .collect();
+    assert_eq!(updates.len(), 2, "one update with the context, one without");
+    let first = &updates[0]["session"]["audio"]["input"]["transcription"];
+    assert_eq!(first["prompt"], "I dictate code.");
+    let second = &updates[1]["session"]["audio"]["input"]["transcription"];
+    assert!(
+        second["prompt"].is_null() && second["keywords"].is_null(),
+        "{second}"
+    );
+    assert_eq!(second["model"], LIVE_TRANSCRIBE_MODEL);
 }
 
 /// Less than the 100 ms OpenAI will commit is answered with an empty transcript

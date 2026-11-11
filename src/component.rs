@@ -20,8 +20,8 @@ wit_bindgen::generate!({
 });
 
 use crate::{
-    DEFAULT_BASE_URL, build_multipart, encode_wav, endpoint_url, needs_api_key, parse_base,
-    parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
+    DEFAULT_BASE_URL, build_multipart, context_prompt, encode_wav, endpoint_url, needs_api_key,
+    parse_base, parse_transcript, resolve_model, unreachable_detail, upstream_status_detail,
 };
 
 use exports::wasi::http::incoming_handler::Guest;
@@ -76,13 +76,13 @@ fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
     // Read the configurable base URL from the daemon-injected header, falling
     // back to the default OpenAI API endpoint. The default carries `/v1` for
     // the same reason a user-set value does: it is an SDK-style base URL.
-    let base_url = crate::header(&entries, "x-stt-option-base_url")
+    let base_url = crate::header(&entries, "x-voice-option-base_url")
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     // The key is optional: a self-hosted endpoint usually wants no
     // `authorization` header at all. Against OpenAI itself a missing key is
     // still worth naming, since the alternative is an opaque 401.
     let api_key =
-        crate::header(&entries, "x-stt-secret-openai_api_key").filter(|k| !k.trim().is_empty());
+        crate::header(&entries, "x-voice-secret-openai_api_key").filter(|k| !k.trim().is_empty());
     if api_key.is_none() && needs_api_key(&base_url) {
         // Include a human-readable `detail` that the daemon surfaces to the user.
         return (
@@ -97,8 +97,8 @@ fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
     // The manifest's `other` entry carries no name of its own; the model the
     // server actually serves comes from the `custom_model` option.
     let selected =
-        crate::header(&entries, "x-stt-model").unwrap_or_else(|| "whisper-1".to_string());
-    let custom = crate::header(&entries, "x-stt-option-custom_model");
+        crate::header(&entries, "x-voice-model").unwrap_or_else(|| "whisper-1".to_string());
+    let custom = crate::header(&entries, "x-voice-option-custom_model");
     let Some(model) = resolve_model(&selected, custom.as_deref()) else {
         return (
             400,
@@ -142,11 +142,20 @@ fn transcribe(request: &IncomingRequest) -> (u16, Vec<u8>) {
         Some(code) => Some(code),
     };
 
+    // The user's dictation context, as one `prompt` string. Read from the
+    // headers rather than the body: it is the daemon's, not the caller's, and
+    // it rides every `/v1` request the same way the secret and the options do.
+    let prompt = context_prompt(
+        crate::header(&entries, "x-voice-prompt").as_deref(),
+        crate::header(&entries, "x-voice-vocabulary").as_deref(),
+    );
+
     match call_openai(
         &base_url,
         api_key.as_deref(),
         &model,
         language,
+        prompt.as_deref(),
         &audio,
         sample_rate,
     ) {
@@ -169,12 +178,13 @@ fn call_openai(
     api_key: Option<&str>,
     model: &str,
     language: Option<&str>,
+    prompt: Option<&str>,
     audio: &[f32],
     sample_rate: u32,
 ) -> Result<String, String> {
     let wav = encode_wav(audio, sample_rate);
     let boundary = "----superstt7MA4YWxkTrZu0gW";
-    let multipart = build_multipart(boundary, model, language, &wav);
+    let multipart = build_multipart(boundary, model, language, prompt, &wav);
     let (https, authority, prefix) = parse_base(base_url);
     let scheme = if https { Scheme::Https } else { Scheme::Http };
     let path = format!("{prefix}/audio/transcriptions");

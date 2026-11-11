@@ -3,10 +3,10 @@
 //!
 //! The component exports both halves of that world:
 //!
-//! * `wasi:http/incoming-handler` — the Super STT `/v1` batch contract
+//! * `wasi:http/incoming-handler` — the Super Voice `/v1` batch contract
 //!   (`docs/protocol/backend/contract.md`), dispatching on method + path. This
 //!   path is stateless: the daemon injects the API key as the
-//!   `x-stt-secret-openai_api_key` request header (absent when the user set
+//!   `x-voice-secret-openai_api_key` request header (absent when the user set
 //!   none) and the model in the transcribe body, and the component forwards
 //!   audio to the OpenAI transcription API — or to whatever OpenAI-compatible
 //!   endpoint the `base_url` option names — over
@@ -34,14 +34,24 @@ use base64::Engine as _;
 mod component;
 
 /// Case-insensitive header lookup over a `(name, value)` list. Both transports
-/// read the daemon's injected `x-stt-*` context this way — the batch path off
+/// read the daemon's injected headers this way — the batch path off
 /// `Fields::entries()`, the realtime path off the `ws-server.handle` argument.
+///
+/// `want` is the Super Voice name, `x-voice-…`. A request without it is looked
+/// up under its Super STT name, `x-stt-…`: a Super Voice daemon sends every
+/// header under both, and a Super STT daemon only under the old one.
 #[must_use]
 pub fn header(entries: &[(String, Vec<u8>)], want: &str) -> Option<String> {
-    entries
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(want))
-        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    };
+    find(want).or_else(|| {
+        let rest = want.strip_prefix("x-voice-")?;
+        find(&format!("x-stt-{rest}"))
+    })
 }
 
 // ── pure helpers (host-testable) ────────────────────────────────────────────
@@ -225,10 +235,85 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a `multipart/form-data` body with `model`, an optional `language`, and
-/// `file` (audio.wav).
+/// Turn the daemon's dictation-context headers into the single `prompt` string
+/// OpenAI's transcription API takes.
+///
+/// `raw_prompt` is `x-voice-prompt` (a JSON string) and `raw_vocabulary` is
+/// `x-voice-vocabulary` (a JSON array of strings), exactly as
+/// `docs/protocol/backend/contract.md` describes them. Both are escaped to
+/// pure ASCII by the daemon, so `serde_json` is the whole decode.
+///
+/// The two halves are joined because OpenAI has one field for them, and the
+/// **vocabulary goes first**. It is the half `whisper-1` can actually use —
+/// OpenAI's own guide describes the parameter as a way "to pass a dictionary of
+/// the correct spellings" and its example is a bare comma-separated list of
+/// names, while the same guide says "Whisper doesn't follow instructions like a
+/// general-purpose text model". Leading with the list gives the older model the
+/// shape it was shown; `gpt-4o-transcribe`, which does follow instructions,
+/// reads the sentence that follows.
+///
+/// Nothing is truncated here. `whisper-1` documents a 224-token ceiling but not
+/// what happens past it, so guessing which end to cut would be inventing a rule
+/// the API has not stated — and the daemon has already refused anything long
+/// enough to break the request itself.
+///
+/// Returns `None` when neither header carries anything, so the caller omits the
+/// field rather than sending an empty one.
 #[must_use]
-pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav: &[u8]) -> Vec<u8> {
+pub fn context_prompt(raw_prompt: Option<&str>, raw_vocabulary: Option<&str>) -> Option<String> {
+    // A header that will not parse is dropped rather than failing the request:
+    // a malformed context is the daemon's bug, and losing a transcription over
+    // it would take the user's audio down with it.
+    let terms: Vec<String> = raw_vocabulary
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let instructions = raw_prompt
+        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+        .unwrap_or_default();
+
+    fold_context(Some(instructions.as_str()), &terms)
+}
+
+/// Join a prompt and a vocabulary into the one string an API with a single
+/// field takes: the terms first, then the sentence.
+///
+/// Shared by [`context_prompt`] and by the realtime fallback for a model that
+/// takes no `keywords`, so the two cannot drift into describing the same
+/// context differently.
+///
+/// The terms lead because they are the half the older models can use at all —
+/// OpenAI's guide shows a bare comma-separated list of names and says in the
+/// same breath that "Whisper doesn't follow instructions like a general-purpose
+/// text model". The sentence follows for the models that do follow them.
+#[must_use]
+fn fold_context(prompt: Option<&str>, terms: &[String]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    let joined = terms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !joined.is_empty() {
+        parts.push(joined);
+    }
+    let instructions = prompt.unwrap_or_default().trim();
+    if !instructions.is_empty() {
+        parts.push(instructions.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
+}
+
+/// Build a `multipart/form-data` body with `model`, an optional `language`, an
+/// optional `prompt`, and `file` (audio.wav).
+#[must_use]
+pub fn build_multipart(
+    boundary: &str,
+    model: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    wav: &[u8],
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
@@ -238,6 +323,12 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
         body.extend_from_slice(lang.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    if let Some(prompt) = prompt.filter(|p| !p.is_empty()) {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(prompt.as_bytes());
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -260,7 +351,7 @@ pub fn build_multipart(boundary: &str, model: &str, language: Option<&str>, wav:
 pub const REALTIME_SAMPLE_RATE: u32 = 24000;
 
 /// OpenAI's realtime transcription model, and the model a session assumes when
-/// the daemon injects no `x-stt-model`. It is also the one model that takes a
+/// the daemon injects no `x-voice-model`. It is also the one model that takes a
 /// `languages` list where the others take a singular `language` — sending both
 /// spellings is an error, so [`session_update_json`] picks by name.
 pub const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
@@ -300,12 +391,94 @@ pub fn ws_unreachable_detail(endpoint: &str, secure: bool, cause: &str) -> Strin
     format!("Could not reach {endpoint} ({cause}).{hint}")
 }
 
+/// One field of a realtime session config, with the characters OpenAI refuses
+/// taken out.
+///
+/// The realtime API is stricter than the batch one about what a `prompt` or a
+/// `keywords` entry may contain: no `<`, no `>`, no carriage return, no line
+/// feed, and "Keep each keyword on one line". It does not ignore a value that
+/// breaks those rules — it **rejects the session update**, which kills the take
+/// before a word of it is transcribed.
+///
+/// That makes this a correctness requirement rather than tidiness. A context's
+/// prompt is typed into a multi-line box, so newlines in it are the expected
+/// case, not the exotic one; passing one through raw would turn a perfectly
+/// reasonable prompt into a broken recording.
+///
+/// Line breaks become spaces rather than vanishing, so two lines do not run
+/// into one word. The angle brackets are dropped outright: they carry nothing a
+/// model hears, so `<name>` is worth more as `name` than as `  name  `.
+#[must_use]
+pub fn realtime_safe(value: &str) -> String {
+    let stripped: String = value
+        .chars()
+        .map(|c| match c {
+            '\r' | '\n' => ' ',
+            '<' | '>' => '\0',
+            other => other,
+        })
+        .filter(|c| *c != '\0')
+        .collect();
+    // Collapse the runs the substitutions above can leave behind, so a prompt
+    // written as two paragraphs does not arrive with a gap in the middle.
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decode the daemon's two context headers into the two fields a realtime
+/// session takes.
+///
+/// The realtime API has a field for each half — `prompt` for "the recording or
+/// its setting", `keywords` for "product names, acronyms, and other literal
+/// terms" — so unlike the batch path they are not folded together. That is the
+/// whole reason the daemon carries the vocabulary as a list: each consumer
+/// shapes it the way its own API wants, and here that shape is an array.
+///
+/// Both halves are put through [`realtime_safe`]. A keyword that is nothing but
+/// forbidden characters is dropped rather than sent empty.
+#[must_use]
+pub fn realtime_context(
+    raw_prompt: Option<&str>,
+    raw_vocabulary: Option<&str>,
+) -> (Option<String>, Vec<String>) {
+    // A header that will not parse costs the context, not the session — the
+    // same trade the batch path makes, and for the same reason.
+    let prompt = raw_prompt
+        .and_then(|raw| serde_json::from_str::<String>(raw).ok())
+        .map(|p| realtime_safe(&p))
+        .filter(|p| !p.is_empty());
+    let keywords = raw_vocabulary
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .map(|term| realtime_safe(term))
+        .filter(|term| !term.is_empty())
+        .collect();
+    (prompt, keywords)
+}
+
 /// The `session.update` that configures a transcription-only realtime session.
 ///
 /// Turn detection is off: the consumer decides when its turn ends (a `stop`
 /// frame or a close), and the session commits the buffer once at that point.
+///
+/// `prompt` and `keywords` are the user's dictation context, already sanitized
+/// by [`realtime_context`]. Only [`LIVE_TRANSCRIBE_MODEL`] is sent `keywords`
+/// as its own field: the guide documents it against that model, and the same
+/// model/field sensitivity that splits `languages` from `language` just below
+/// applies here. Every other realtime model — including the `other-realtime`
+/// placeholder, which points at a third-party server that almost certainly
+/// never heard of `keywords` — gets the terms folded into `prompt` instead,
+/// which is what the batch path does and is strictly better than sending
+/// nothing. Guessing wrong in the other direction is expensive: an unknown
+/// field is not ignored here, it is a rejected session update, and that ends
+/// the take.
 #[must_use]
-pub fn session_update_json(model: &str, language: Option<&str>) -> String {
+pub fn session_update_json(
+    model: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    keywords: &[String],
+) -> String {
     let mut transcription = serde_json::json!({ "model": model });
     if let Some(code) = language {
         if model == LIVE_TRANSCRIBE_MODEL {
@@ -313,6 +486,16 @@ pub fn session_update_json(model: &str, language: Option<&str>) -> String {
         } else {
             transcription["language"] = serde_json::Value::String(code.to_string());
         }
+    }
+    if model == LIVE_TRANSCRIBE_MODEL {
+        if let Some(prompt) = prompt {
+            transcription["prompt"] = serde_json::Value::String(prompt.to_string());
+        }
+        if !keywords.is_empty() {
+            transcription["keywords"] = serde_json::json!(keywords);
+        }
+    } else if let Some(folded) = fold_context(prompt, keywords) {
+        transcription["prompt"] = serde_json::Value::String(folded);
     }
     serde_json::json!({
         "type": "session.update",
@@ -471,10 +654,10 @@ impl Resampler {
 mod tests {
     use super::{
         DEFAULT_BASE_URL, LIVE_TRANSCRIBE_MODEL, REALTIME_SAMPLE_RATE, Resampler,
-        audio_append_json, build_multipart, done_json, encode_wav, endpoint_url, error_json,
-        is_stop, needs_api_key, parse_base, parse_start, parse_transcript, preview_json,
-        realtime_ws_url, resolve_model, session_update_json, unreachable_detail,
-        upstream_status_detail, ws_unreachable_detail,
+        audio_append_json, build_multipart, context_prompt, done_json, encode_wav, endpoint_url,
+        error_json, header, is_stop, needs_api_key, parse_base, parse_start, parse_transcript,
+        preview_json, realtime_context, realtime_safe, realtime_ws_url, resolve_model,
+        session_update_json, unreachable_detail, upstream_status_detail, ws_unreachable_detail,
     };
     use base64::Engine as _;
 
@@ -693,9 +876,26 @@ mod tests {
         assert_eq!(min, -i16::MAX);
     }
 
+    /// A Super Voice daemon sends each header under its `x-voice-` name and its
+    /// `x-stt-` one; a Super STT daemon under the old one alone.
+    #[test]
+    fn a_header_is_read_under_its_super_voice_name_or_its_super_stt_one() {
+        let entry = |k: &str, v: &str| (k.to_string(), v.as_bytes().to_vec());
+        let voice = [entry("X-Voice-Model", "gpt-4o-transcribe")];
+        assert_eq!(
+            header(&voice, "x-voice-model").as_deref(),
+            Some("gpt-4o-transcribe")
+        );
+        let stt = [entry("x-stt-model", "whisper-1")];
+        assert_eq!(header(&stt, "x-voice-model").as_deref(), Some("whisper-1"));
+        let both = [entry("x-stt-model", "old"), entry("x-voice-model", "new")];
+        assert_eq!(header(&both, "x-voice-model").as_deref(), Some("new"));
+        assert_eq!(header(&stt, "x-voice-prompt"), None);
+    }
+
     #[test]
     fn build_multipart_frames_model_and_file() {
-        let body = build_multipart("BOUNDARY", "whisper-1", None, b"WAVDATA");
+        let body = build_multipart("BOUNDARY", "whisper-1", None, None, b"WAVDATA");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("--BOUNDARY\r\n"));
         assert!(text.contains("name=\"model\""));
@@ -711,10 +911,101 @@ mod tests {
 
     #[test]
     fn build_multipart_includes_language_when_present() {
-        let body = build_multipart("BOUNDARY", "whisper-1", Some("es"), b"WAVDATA");
+        let body = build_multipart("BOUNDARY", "whisper-1", Some("es"), None, b"WAVDATA");
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("name=\"language\""));
         assert!(text.contains("\r\n\r\nes\r\n"));
+    }
+
+    #[test]
+    fn build_multipart_includes_the_prompt_when_present() {
+        let body = build_multipart(
+            "BOUNDARY",
+            "whisper-1",
+            None,
+            Some("main branch, kubectl"),
+            b"WAVDATA",
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("name=\"prompt\""));
+        assert!(text.contains("\r\n\r\nmain branch, kubectl\r\n"));
+
+        // An empty prompt is no prompt: the field is omitted rather than sent
+        // blank, which is a different request.
+        let empty = build_multipart("BOUNDARY", "whisper-1", None, Some(""), b"WAVDATA");
+        assert!(!String::from_utf8_lossy(&empty).contains("name=\"prompt\""));
+    }
+
+    /// The vocabulary leads, because it is the half `whisper-1` can use at all
+    /// — OpenAI's guide shows a bare comma-separated list and says the model
+    /// does not follow instructions. The sentence follows it for the models
+    /// that do.
+    #[test]
+    fn the_context_becomes_one_prompt_with_the_words_first() {
+        let prompt = context_prompt(
+            Some(r#""I dictate code.""#),
+            Some(r#"["main branch","kubectl"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("main branch, kubectl. I dictate code.")
+        );
+    }
+
+    /// Either half on its own is a perfectly good context, and neither is.
+    #[test]
+    fn each_half_stands_alone_and_neither_is_nothing() {
+        assert_eq!(
+            context_prompt(None, Some(r#"["kubectl"]"#)).as_deref(),
+            Some("kubectl")
+        );
+        assert_eq!(
+            context_prompt(Some(r#""Be terse.""#), None).as_deref(),
+            Some("Be terse.")
+        );
+        assert_eq!(context_prompt(None, None), None);
+        assert_eq!(
+            context_prompt(Some(r#"""#.repeat(2).as_str()), Some("[]")),
+            None,
+            "empty on both sides sends no field at all"
+        );
+        assert_eq!(
+            context_prompt(Some(r#""   ""#), Some(r#"["  ",""]"#)),
+            None,
+            "whitespace is not a context"
+        );
+    }
+
+    /// The daemon escapes both headers to pure ASCII, so a Spanish prompt
+    /// arrives as `\uXXXX` and has to come back out as itself. This is the
+    /// backend half of the round trip the daemon's encoder exists for.
+    #[test]
+    fn a_non_ascii_context_decodes_back_to_what_the_user_typed() {
+        let prompt = context_prompt(
+            Some(r#""Dicto c\u00f3digo.""#),
+            Some(r#"["Menjivar, Jorge","caf\u00e9"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("Menjivar, Jorge, café. Dicto código."),
+            "a term holding a comma survives as one term, which a flat header could not promise"
+        );
+    }
+
+    /// A header the backend cannot parse costs the context, not the
+    /// transcription. Losing the user's audio over the daemon's bug would be
+    /// the worse of the two failures by a wide margin.
+    #[test]
+    fn a_malformed_header_is_dropped_rather_than_failing_the_request() {
+        assert_eq!(
+            context_prompt(Some("not json"), Some("also not json")),
+            None
+        );
+        assert_eq!(
+            context_prompt(Some("not json"), Some(r#"["kubectl"]"#)).as_deref(),
+            Some("kubectl"),
+            "one bad half does not take the other with it"
+        );
     }
 
     // ── realtime helpers ────────────────────────────────────────────────────
@@ -790,7 +1081,7 @@ mod tests {
     #[test]
     fn session_update_json_configures_a_transcription_session() {
         let v: serde_json::Value =
-            serde_json::from_str(&session_update_json("whisper-1", Some("es"))).unwrap();
+            serde_json::from_str(&session_update_json("whisper-1", Some("es"), None, &[])).unwrap();
         assert_eq!(v["type"], "session.update");
         assert_eq!(v["session"]["type"], "transcription");
         let input = &v["session"]["audio"]["input"];
@@ -805,18 +1096,128 @@ mod tests {
     /// upstream error, so only one may ever appear.
     #[test]
     fn session_update_json_uses_the_plural_field_for_live_transcribe() {
-        let v: serde_json::Value =
-            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, Some("en"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            LIVE_TRANSCRIBE_MODEL,
+            Some("en"),
+            None,
+            &[],
+        ))
+        .unwrap();
         let transcription = &v["session"]["audio"]["input"]["transcription"];
         assert_eq!(transcription["languages"][0], "en");
         assert!(transcription["language"].is_null());
 
         // No language at all: neither field appears, and the model detects it.
         let v: serde_json::Value =
-            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None)).unwrap();
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None, None, &[]))
+                .unwrap();
         let transcription = &v["session"]["audio"]["input"]["transcription"];
         assert!(transcription["languages"].is_null());
         assert!(transcription["language"].is_null());
+    }
+
+    /// The realtime API takes the two halves as two fields, so unlike the batch
+    /// path they stay apart — and the vocabulary stays a list, which is the
+    /// whole reason the daemon carries it as one.
+    #[test]
+    fn session_update_json_sends_the_context_as_prompt_and_keywords() {
+        let keywords = vec!["main branch".to_string(), "kubectl".to_string()];
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            LIVE_TRANSCRIBE_MODEL,
+            None,
+            Some("I dictate code."),
+            &keywords,
+        ))
+        .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert_eq!(transcription["prompt"], "I dictate code.");
+        assert_eq!(transcription["keywords"][0], "main branch");
+        assert_eq!(transcription["keywords"][1], "kubectl");
+
+        // No context: neither field appears, rather than appearing empty.
+        let v: serde_json::Value =
+            serde_json::from_str(&session_update_json(LIVE_TRANSCRIBE_MODEL, None, None, &[]))
+                .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert!(transcription["prompt"].is_null());
+        assert!(transcription["keywords"].is_null());
+    }
+
+    /// A model that does not document `keywords` never receives the field.
+    ///
+    /// Guessing wrong here is not a no-op: an unknown field is a rejected
+    /// session update, which ends the take before a word is transcribed. So the
+    /// terms are folded into `prompt` instead, exactly as the batch path does.
+    #[test]
+    fn a_model_without_keywords_gets_the_terms_folded_into_the_prompt() {
+        let keywords = vec!["main branch".to_string(), "kubectl".to_string()];
+        let v: serde_json::Value = serde_json::from_str(&session_update_json(
+            "some-third-party-model",
+            None,
+            Some("I dictate code."),
+            &keywords,
+        ))
+        .unwrap();
+        let transcription = &v["session"]["audio"]["input"]["transcription"];
+        assert!(
+            transcription["keywords"].is_null(),
+            "a field this model never documented must not be sent"
+        );
+        assert_eq!(
+            transcription["prompt"], "main branch, kubectl. I dictate code.",
+            "the same shape the batch path builds, so the two cannot describe one context differently"
+        );
+    }
+
+    /// The realtime API rejects a session update over these characters, so a
+    /// prompt typed as two paragraphs would otherwise break the take. Newlines
+    /// become spaces rather than vanishing, so two lines do not run together
+    /// into one word.
+    #[test]
+    fn realtime_safe_removes_what_the_api_refuses() {
+        assert_eq!(realtime_safe("line one\nline two"), "line one line two");
+        assert_eq!(realtime_safe("a\r\nb"), "a b");
+        assert_eq!(realtime_safe("<name>"), "name");
+        assert_eq!(realtime_safe("a < b > c"), "a b c");
+        // Runs the substitutions leave behind are collapsed.
+        assert_eq!(realtime_safe("a\n\n\nb"), "a b");
+        assert_eq!(realtime_safe("  padded  "), "padded");
+        // Nothing but forbidden characters is nothing.
+        assert_eq!(realtime_safe("<>\n\r"), "");
+    }
+
+    #[test]
+    fn realtime_context_decodes_and_sanitizes_both_halves() {
+        let (prompt, keywords) = realtime_context(
+            Some(r#""I dictate code.\nPrefer <programming> terms.""#),
+            Some(r#"["main branch","caf\u00e9","<>","multi\nline"]"#),
+        );
+        assert_eq!(
+            prompt.as_deref(),
+            Some("I dictate code. Prefer programming terms.")
+        );
+        assert_eq!(
+            keywords,
+            vec![
+                "main branch".to_string(),
+                "café".to_string(),
+                "multi line".to_string(),
+            ],
+            "a keyword that was only forbidden characters is dropped, not sent empty"
+        );
+    }
+
+    #[test]
+    fn realtime_context_survives_a_missing_or_malformed_header() {
+        assert_eq!(realtime_context(None, None), (None, Vec::new()));
+        let (prompt, keywords) = realtime_context(Some("not json"), Some(r#"["kubectl"]"#));
+        assert_eq!(prompt, None, "one bad half does not take the other with it");
+        assert_eq!(keywords, vec!["kubectl".to_string()]);
+        // A prompt that is only whitespace is no prompt.
+        assert_eq!(
+            realtime_context(Some(r#""   ""#), Some("[]")),
+            (None, Vec::new())
+        );
     }
 
     #[test]
