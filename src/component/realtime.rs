@@ -131,17 +131,41 @@ fn run(headers: &[(String, Vec<u8>)], consumer: &ConsumerStream) -> Result<(), W
         crate::header(headers, "x-voice-prompt").as_deref(),
         crate::header(headers, "x-voice-vocabulary").as_deref(),
     );
-    if let Err(e) = upstream.send_text(&crate::session_update_json(
-        &model,
-        language.as_deref(),
-        prompt.as_deref(),
-        &keywords,
-    )) {
-        let _ = consumer.send_text(&crate::error_json(&format!(
-            "{url} rejected the session configuration ({})",
-            describe(&e)
-        )));
+    let send_update = |prompt: Option<&str>, keywords: &[String]| {
+        let update = crate::session_update_json(&model, language.as_deref(), prompt, keywords);
+        upstream.send_text(&update).map_err(|e| {
+            let _ = consumer.send_text(&crate::error_json(&format!(
+                "{url} rejected the session configuration ({})",
+                describe(&e)
+            )));
+        })
+    };
+    if send_update(prompt.as_deref(), &keywords).is_err() {
         return Ok(());
+    }
+    // OpenAI answers a session update with `session.updated`, or with an
+    // `error` when it will not take it: a prompt past the model's length
+    // limit, which it does not publish, is refused that way. A context it
+    // refuses should cost the context, not the recording, so the session waits
+    // for the answer and configures itself again without one. Only for
+    // OpenAI's own model, the one whose answer is documented: a server that
+    // never sent one would leave a session that waited for it hanging.
+    let has_context = prompt.is_some() || !keywords.is_empty();
+    if has_context && model == crate::LIVE_TRANSCRIBE_MODEL {
+        match await_session_updated(&upstream) {
+            Updated::Yes => {}
+            Updated::Refused => {
+                if send_update(None, &[]).is_err() {
+                    return Ok(());
+                }
+            }
+            Updated::Closed => {
+                let _ = consumer.send_text(&crate::error_json(&format!(
+                    "{url} closed the connection while the session was being configured."
+                )));
+                return Ok(());
+            }
+        }
     }
 
     // 4. Pump audio up and transcripts down, both sockets serviced as either
@@ -289,6 +313,34 @@ fn await_session_created(upstream: &WsStream, consumer: &ConsumerStream, url: &s
                 )));
                 return false;
             }
+        }
+    }
+}
+
+/// How the upstream answered a session update.
+enum Updated {
+    /// `session.updated`: it took the configuration.
+    Yes,
+    /// `error`: it refused it.
+    Refused,
+    /// It closed the socket, or the read failed.
+    Closed,
+}
+
+/// Read upstream until it answers the session update just sent. Both
+/// spellings are accepted, as for the handshake: `session.updated` from the GA
+/// API, `transcription_session.updated` from the earlier transcription-session
+/// one.
+fn await_session_updated(upstream: &WsStream) -> Updated {
+    loop {
+        match upstream.recv() {
+            Ok(WsFrame::Text(s)) => match event_type(&s).as_deref() {
+                Some("session.updated" | "transcription_session.updated") => return Updated::Yes,
+                Some("error") => return Updated::Refused,
+                _ => {}
+            },
+            Ok(WsFrame::Binary(_)) => {}
+            Ok(WsFrame::Close(_)) | Err(_) => return Updated::Closed,
         }
     }
 }
