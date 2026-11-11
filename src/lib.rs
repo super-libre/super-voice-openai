@@ -6,7 +6,7 @@
 //! * `wasi:http/incoming-handler` — the Super STT `/v1` batch contract
 //!   (`docs/protocol/backend/contract.md`), dispatching on method + path. This
 //!   path is stateless: the daemon injects the API key as the
-//!   `x-stt-secret-openai_api_key` request header (absent when the user set
+//!   `x-voice-secret-openai_api_key` request header (absent when the user set
 //!   none) and the model in the transcribe body, and the component forwards
 //!   audio to the OpenAI transcription API — or to whatever OpenAI-compatible
 //!   endpoint the `base_url` option names — over
@@ -34,14 +34,24 @@ use base64::Engine as _;
 mod component;
 
 /// Case-insensitive header lookup over a `(name, value)` list. Both transports
-/// read the daemon's injected `x-stt-*` context this way — the batch path off
+/// read the daemon's injected headers this way — the batch path off
 /// `Fields::entries()`, the realtime path off the `ws-server.handle` argument.
+///
+/// `want` is the Super Voice name, `x-voice-…`. A request without it is looked
+/// up under its Super STT name, `x-stt-…`: a Super Voice daemon sends every
+/// header under both, and a Super STT daemon only under the old one.
 #[must_use]
 pub fn header(entries: &[(String, Vec<u8>)], want: &str) -> Option<String> {
-    entries
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(want))
-        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    let find = |name: &str| {
+        entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    };
+    find(want).or_else(|| {
+        let rest = want.strip_prefix("x-voice-")?;
+        find(&format!("x-stt-{rest}"))
+    })
 }
 
 // ── pure helpers (host-testable) ────────────────────────────────────────────
@@ -228,8 +238,8 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Turn the daemon's dictation-context headers into the single `prompt` string
 /// OpenAI's transcription API takes.
 ///
-/// `raw_prompt` is `x-stt-prompt` (a JSON string) and `raw_vocabulary` is
-/// `x-stt-vocabulary` (a JSON array of strings), exactly as
+/// `raw_prompt` is `x-voice-prompt` (a JSON string) and `raw_vocabulary` is
+/// `x-voice-vocabulary` (a JSON array of strings), exactly as
 /// `docs/protocol/backend/contract.md` describes them. Both are escaped to
 /// pure ASCII by the daemon, so `serde_json` is the whole decode.
 ///
@@ -341,7 +351,7 @@ pub fn build_multipart(
 pub const REALTIME_SAMPLE_RATE: u32 = 24000;
 
 /// OpenAI's realtime transcription model, and the model a session assumes when
-/// the daemon injects no `x-stt-model`. It is also the one model that takes a
+/// the daemon injects no `x-voice-model`. It is also the one model that takes a
 /// `languages` list where the others take a singular `language` — sending both
 /// spellings is an error, so [`session_update_json`] picks by name.
 pub const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
@@ -645,7 +655,7 @@ mod tests {
     use super::{
         DEFAULT_BASE_URL, LIVE_TRANSCRIBE_MODEL, REALTIME_SAMPLE_RATE, Resampler,
         audio_append_json, build_multipart, context_prompt, done_json, encode_wav, endpoint_url,
-        error_json, is_stop, needs_api_key, parse_base, parse_start, parse_transcript,
+        error_json, header, is_stop, needs_api_key, parse_base, parse_start, parse_transcript,
         preview_json, realtime_context, realtime_safe, realtime_ws_url, resolve_model,
         session_update_json, unreachable_detail, upstream_status_detail, ws_unreachable_detail,
     };
@@ -864,6 +874,23 @@ mod tests {
         let min = i16::from_le_bytes([wav[48], wav[49]]);
         assert_eq!(max, i16::MAX);
         assert_eq!(min, -i16::MAX);
+    }
+
+    /// A Super Voice daemon sends each header under its `x-voice-` name and its
+    /// `x-stt-` one; a Super STT daemon under the old one alone.
+    #[test]
+    fn a_header_is_read_under_its_super_voice_name_or_its_super_stt_one() {
+        let entry = |k: &str, v: &str| (k.to_string(), v.as_bytes().to_vec());
+        let voice = [entry("X-Voice-Model", "gpt-4o-transcribe")];
+        assert_eq!(
+            header(&voice, "x-voice-model").as_deref(),
+            Some("gpt-4o-transcribe")
+        );
+        let stt = [entry("x-stt-model", "whisper-1")];
+        assert_eq!(header(&stt, "x-voice-model").as_deref(), Some("whisper-1"));
+        let both = [entry("x-stt-model", "old"), entry("x-voice-model", "new")];
+        assert_eq!(header(&both, "x-voice-model").as_deref(), Some("new"));
+        assert_eq!(header(&stt, "x-voice-prompt"), None);
     }
 
     #[test]

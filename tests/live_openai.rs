@@ -14,7 +14,7 @@ mod common;
 
 use common::{WasmBackend, component_path};
 
-const SECRET: &str = "x-stt-secret-openai_api_key";
+const SECRET: &str = "x-voice-secret-openai_api_key";
 
 #[tokio::test]
 async fn live_openai() {

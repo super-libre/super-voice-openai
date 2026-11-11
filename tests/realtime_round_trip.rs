@@ -19,11 +19,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-const SECRET: &str = "x-stt-secret-openai_api_key";
-const BASE_URL: &str = "x-stt-option-base_url";
-const CUSTOM_MODEL: &str = "x-stt-option-custom_model";
-const PROMPT: &str = "x-stt-prompt";
-const VOCABULARY: &str = "x-stt-vocabulary";
+const SECRET: &str = "x-voice-secret-openai_api_key";
+const BASE_URL: &str = "x-voice-option-base_url";
+const CUSTOM_MODEL: &str = "x-voice-option-custom_model";
+const PROMPT: &str = "x-voice-prompt";
+const VOCABULARY: &str = "x-voice-vocabulary";
 
 /// 3200 bytes = 1600 samples = 100 ms at 16 kHz — the shape a consumer streams.
 const CHUNK_100MS: usize = 3200;
@@ -146,7 +146,7 @@ async fn realtime_round_trip() {
     let path = component_or_skip!();
     let (authority, mock) = start_mock_upstream().await;
 
-    // The guest builds the upstream URL from x-stt-option-base_url. Point it at
+    // The guest builds the upstream URL from x-voice-option-base_url. Point it at
     // the mock over plaintext ws:// (http:// -> ws:// in the guest). The mock is
     // on loopback, which the SSRF guard blocks for untrusted backends, so the
     // test opts in via `permit_loopback_egress` below.

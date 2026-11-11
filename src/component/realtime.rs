@@ -44,19 +44,19 @@ fn settings(
     headers: &[(String, Vec<u8>)],
     consumer: &ConsumerStream,
 ) -> Option<(String, Option<String>, String)> {
-    let base_url = crate::header(headers, "x-stt-option-base_url")
+    let base_url = crate::header(headers, "x-voice-option-base_url")
         .unwrap_or_else(|| crate::DEFAULT_BASE_URL.to_string());
     let api_key =
-        crate::header(headers, "x-stt-secret-openai_api_key").filter(|k| !k.trim().is_empty());
+        crate::header(headers, "x-voice-secret-openai_api_key").filter(|k| !k.trim().is_empty());
     if api_key.is_none() && crate::needs_api_key(&base_url) {
         let _ = consumer.send_text(&crate::error_json(
             "OpenAI API key not set. Add it in Settings \u{2192} Models \u{2192} OpenAI.",
         ));
         return None;
     }
-    let selected = crate::header(headers, "x-stt-model")
+    let selected = crate::header(headers, "x-voice-model")
         .unwrap_or_else(|| crate::LIVE_TRANSCRIBE_MODEL.to_string());
-    let custom = crate::header(headers, "x-stt-option-custom_model");
+    let custom = crate::header(headers, "x-voice-option-custom_model");
     let Some(model) = crate::resolve_model(&selected, custom.as_deref()) else {
         let _ = consumer.send_text(&crate::error_json(
             "Custom model name not set. Add it in Settings \u{2192} Models \u{2192} OpenAI, or pick a listed model.",
@@ -128,8 +128,8 @@ fn run(headers: &[(String, Vec<u8>)], consumer: &ConsumerStream) -> Result<(), W
     // a session already running, which is the same rule as every other setting
     // on this path.
     let (prompt, keywords) = crate::realtime_context(
-        crate::header(headers, "x-stt-prompt").as_deref(),
-        crate::header(headers, "x-stt-vocabulary").as_deref(),
+        crate::header(headers, "x-voice-prompt").as_deref(),
+        crate::header(headers, "x-voice-vocabulary").as_deref(),
     );
     if let Err(e) = upstream.send_text(&crate::session_update_json(
         &model,

@@ -15,11 +15,11 @@ use common::{WasmBackend, component_path};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-const SECRET: &str = "x-stt-secret-openai_api_key";
-const BASE_URL: &str = "x-stt-option-base_url";
-const CUSTOM_MODEL: &str = "x-stt-option-custom_model";
-const PROMPT: &str = "x-stt-prompt";
-const VOCABULARY: &str = "x-stt-vocabulary";
+const SECRET: &str = "x-voice-secret-openai_api_key";
+const BASE_URL: &str = "x-voice-option-base_url";
+const CUSTOM_MODEL: &str = "x-voice-option-custom_model";
+const PROMPT: &str = "x-voice-prompt";
+const VOCABULARY: &str = "x-voice-vocabulary";
 
 /// A `wiremock` matcher asserting the request body contains `needle`. Decodes
 /// lossily because the multipart body carries binary WAV bytes (invalid UTF-8);
@@ -326,6 +326,53 @@ async fn the_dictation_context_is_forwarded_as_the_prompt_field() {
     assert_eq!(text, "push it to the main branch");
 }
 
+/// A Super STT daemon sends its headers only under their `x-stt-` names: the
+/// key, the endpoint and the vocabulary still reach the upstream.
+#[tokio::test]
+async fn the_super_stt_header_names_still_work() {
+    let Some(component) = component_path() else {
+        eprintln!("skipping: component not built (run `just build-component`)");
+        return;
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(header("authorization", "Bearer old-key"))
+        .and(BodyContains("name=\"prompt\"\r\n\r\nkubectl\r\n"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "run kubectl" })),
+        )
+        .mount(&server)
+        .await;
+
+    let authority = server.address().to_string();
+    let mut backend = WasmBackend::new(
+        &component,
+        vec![authority.clone()],
+        "whisper-1".to_string(),
+        vec![
+            (
+                "x-stt-secret-openai_api_key".to_string(),
+                "old-key".to_string(),
+            ),
+            (
+                "x-stt-option-base_url".to_string(),
+                format!("http://{authority}"),
+            ),
+            ("x-stt-vocabulary".to_string(), r#"["kubectl"]"#.to_string()),
+        ],
+    )
+    .expect("load backend")
+    .permit_loopback_egress();
+
+    let text = backend
+        .transcribe_audio(&[0.0_f32; 1600], 16000)
+        .await
+        .expect("transcription should succeed");
+    assert_eq!(text, "run kubectl");
+}
+
 /// A backend given no context sends no `prompt` field, rather than an empty
 /// one — which is a different request, and one OpenAI is entitled to read
 /// differently.
@@ -483,7 +530,7 @@ async fn keyless_request_to_a_custom_endpoint_sends_no_authorization() {
         vec![authority.clone()],
         "other".to_string(),
         vec![
-            // No `x-stt-secret-openai_api_key` at all.
+            // No `x-voice-secret-openai_api_key` at all.
             (BASE_URL.to_string(), format!("http://{authority}/v1")),
             (CUSTOM_MODEL.to_string(), "local-whisper".to_string()),
         ],
