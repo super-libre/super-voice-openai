@@ -13,7 +13,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use common::{ConsumerStreamTransport, WasmBackend, WsFrame};
 use futures::{SinkExt, StreamExt};
-use super_stt_backend_openai::LIVE_TRANSCRIBE_MODEL;
+use super_voice_backend_openai::LIVE_TRANSCRIBE_MODEL;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::accept_async;

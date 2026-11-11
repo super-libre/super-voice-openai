@@ -1,27 +1,27 @@
-# Super STT — OpenAI backend
+# Super Voice — OpenAI backend
 
-[![coverage](https://img.shields.io/endpoint?url=https://jorge-menjivar.github.io/super-stt-openai/coverage.json)](https://jorge-menjivar.github.io/super-stt-openai/)
+[![coverage](https://img.shields.io/endpoint?url=https://super-libre.github.io/super-voice-openai/coverage.json)](https://super-libre.github.io/super-voice-openai/)
 
-A speech-to-text backend for **[Super STT](https://github.com/jorge-menjivar/super-stt)**.
+A speech-to-text backend for **[Super Voice](https://github.com/jorge-menjivar/super-voice)**.
 It proxies audio to [OpenAI](https://platform.openai.com/docs/guides/speech-to-text)'s
 hosted transcription API, so transcription runs in the cloud rather than on your machine.
 
-Super STT is an on-device speech-to-text engine. It doesn't ship any models of its own —
+Super Voice is an on-device speech engine. It doesn't ship any models of its own —
 it loads **backends** like this one at runtime. This repo packages OpenAI as one of those
 backends, shipped as a sandboxed **WASM component** that serves both transports: batch
 transcription over `wasi:http`, and streaming transcription over a WebSocket.
 
 ## Using it
 
-You don't run this directly. Super STT discovers it through its backend registry,
+You don't run this directly. Super Voice discovers it through its backend registry,
 downloads the prebuilt `.wasm` from this repo's GitHub release, and runs it in-process in
 a WASM sandbox whose only network egress is the allowlisted OpenAI API. To use it,
-install Super STT, enable OpenAI from the app, and add your **OpenAI API key** —
-see the [Super STT docs](https://github.com/jorge-menjivar/super-stt).
+install Super Voice, enable OpenAI from the app, and add your **OpenAI API key** —
+see the [Super Voice docs](https://github.com/jorge-menjivar/super-voice).
 
 ## Models
 
-Chosen by `name` when Super STT loads the backend. These are **online** models: they send
+Chosen by `name` when Super Voice loads the backend. These are **online** models: they send
 audio to OpenAI and need an OpenAI API key (set in the app); no local GPU or weights are
 involved.
 
@@ -52,12 +52,13 @@ self-hosted or gateway endpoint set through **API base URL** is called with no
 ## Dictation contexts
 
 This backend accepts a [dictation
-context](https://github.com/jorge-menjivar/super-stt/blob/main/docs/protocol/endpoints/v1/context.md)
+context](https://github.com/jorge-menjivar/super-voice/blob/main/docs/protocol/endpoints/v1/context.md)
 — the words you are dictating, so the model hears them instead of guessing at
 them. Pick one in the app; there is nothing to configure here.
 
-Super STT sends the context's two halves as `x-stt-prompt` and
-`x-stt-vocabulary`, and this backend folds them into the single `prompt` field
+Super Voice sends the context's two halves as `x-voice-prompt` and
+`x-voice-vocabulary` (Super STT as `x-stt-prompt` and `x-stt-vocabulary`, which
+this backend reads too), and this backend folds them into the single `prompt` field
 OpenAI's transcription API takes. The **vocabulary goes first**, because it is
 the half `whisper-1` can use at all: OpenAI's guide describes the parameter as a
 way "to pass a dictionary of the correct spellings" and says in the same breath
@@ -98,7 +99,7 @@ would break the take.
 
 ## Realtime
 
-The `realtime` models stream instead of uploading a finished recording. Super STT hands
+The `realtime` models stream instead of uploading a finished recording. Super Voice hands
 the component a live consumer WebSocket, and the component bridges it to OpenAI's realtime
 transcription API (`wss://api.openai.com/v1/realtime?intent=transcription`) — or to the
 same endpoint on whatever server **API base URL** names. Partial transcripts come back as
@@ -106,7 +107,7 @@ same endpoint on whatever server **API base URL** names. Partial transcripts com
 
 Two details are worth knowing:
 
-- **Sample rate.** OpenAI's realtime API accepts 24 kHz PCM only, and Super STT streams
+- **Sample rate.** OpenAI's realtime API accepts 24 kHz PCM only, and Super Voice streams
   at whatever rate the session declares (16 kHz, typically), so the component resamples on
   the way upstream. Nothing to configure.
 - **Previews arrive late.** The host does not yet implement `wasi:io/poll` for WebSocket
@@ -117,21 +118,21 @@ Two details are worth knowing:
 ## What's in here
 
 A small, self-contained Rust component (`src/lib.rs` plus `src/component/`) that speaks
-the Super STT backend protocol — the `/v1` contract over `wasi:http`, and the
+the Super Voice backend protocol — the `/v1` contract over `wasi:http`, and the
 `super-stt:realtime` WebSocket session — and forwards audio to OpenAI. It shares no code
-with the Super STT project; `wit/` is a vendored copy of the protocol's WIT. The pure
+with the Super Voice project; `wit/` is a vendored copy of the protocol's WIT. The pure
 audio, request-shaping, and realtime-payload helpers are unit-tested natively; the
 component as a whole is exercised by a wasmtime harness under `tests/` that loads the
 built `.wasm` and drives both transports against mock upstreams.
 
 ## Building from source
 
-Most people never need to — Super STT downloads prebuilt releases. For development
+Most people never need to — Super Voice downloads prebuilt releases. For development
 (requires [`just`](https://github.com/casey/just) and the `wasm32-wasip2` target):
 
 ```bash
 rustup target add wasm32-wasip2
-just build-component   # builds target/wasm32-wasip2/release/super_stt_backend_openai.wasm
+just build-component   # builds target/wasm32-wasip2/release/super_voice_backend_openai.wasm
 just ci                # format, lint, build, and test
 ```
 

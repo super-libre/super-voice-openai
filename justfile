@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Task runner for the standalone OpenAI WASM backend. Mirrors the recipe names
-# used by the main super-stt repo (`just check`, `just ci`, etc.).
+# used by the main Super Voice repo (`just check`, `just ci`, etc.).
 
 # Default: build the component
 default: build-component
@@ -16,7 +16,7 @@ build-component *args:
 # same way when attaching it to a GitHub release, so a local install and a
 # published one stage the same bytes under the same name.
 stage: build-component
-    cp target/wasm32-wasip2/release/super_stt_backend_openai.wasm openai.wasm
+    cp target/wasm32-wasip2/release/super_voice_backend_openai.wasm openai.wasm
     @echo "staged openai.wasm — this directory is now installable with Import from dir"
 
 # Lint the shipped component on its real target (wasm32-wasip2). The host build

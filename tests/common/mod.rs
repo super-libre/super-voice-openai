@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Self-contained wasmtime host harness that "plays the daemon": it loads the
 //! prebuilt OpenAI component and drives both halves of the `realtime-backend`
-//! world in-process, exactly as Super STT's daemon does — the batch `/v1`
+//! world in-process, exactly as Super Voice's daemon does — the batch `/v1`
 //! contract over `wasi:http`, and the `super-stt:realtime` WebSocket session —
 //! while confining the component's outbound egress to an allowlist with the
-//! same SSRF guard. This repo shares no code with super-stt; the harness is a
+//! same SSRF guard. This repo shares no code with Super Voice; the harness is a
 //! minimal, independent reimplementation of the daemon's `WasmBackend`
 //! (`stt_models/wasm/{mod,host,ws_host}.rs`).
 //!
@@ -74,7 +74,7 @@ pub use self::super_stt::realtime::ws::{CloseFrame, WsError, WsFrame};
 #[must_use]
 pub fn component_path() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/wasm32-wasip2/release/super_stt_backend_openai.wasm");
+        .join("target/wasm32-wasip2/release/super_voice_backend_openai.wasm");
     p.exists().then_some(p)
 }
 
