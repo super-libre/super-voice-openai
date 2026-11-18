@@ -33,12 +33,6 @@
   # hands each consumer session to. Required by the `realtime = true` models.
   websocket = true
 
-  # Opts into being handed the user's dictation context as `x-voice-prompt` and
-  # `x-voice-vocabulary`. Both are folded into the one `prompt` field OpenAI's
-  # transcription API takes, so a vocabulary the user typed reaches the model
-  # that keeps mishearing those words.
-  context = true
-
 [[secrets]]
   name        = "openai_api_key"
   label       = "OpenAI API key"
@@ -59,6 +53,11 @@
 
 [[models]]
   name                = "whisper-1"
+  # Every model here takes the user's dictation context as `x-voice-prompt` and
+  # `x-voice-vocabulary`. Both are folded into the one `prompt` field OpenAI's
+  # transcription API takes, so a vocabulary the user typed reaches the model
+  # that keeps mishearing those words.
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -125,6 +124,7 @@
 
 [[models]]
   name                = "gpt-4o-transcribe"
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -191,6 +191,7 @@
 
 [[models]]
   name                = "gpt-4o-mini-transcribe"
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -262,6 +263,7 @@
 # unknown here, so nothing narrower would be honest.
 [[models]]
   name                = "other"
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -331,6 +333,7 @@
 # the one model here that streams incremental transcripts back as it hears them.
 [[models]]
   name                = "gpt-live-transcribe"
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
@@ -402,6 +405,7 @@
 # option, and selecting it without setting one is the same error.
 [[models]]
   name                = "other-realtime"
+  accepts_context     = true
   provider            = "openai"
   multilingual        = true
   primary_language    = "en"
